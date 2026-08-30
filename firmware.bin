@@ -4,11 +4,12 @@
 #include <BluetoothSerial.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <HTTPUpdate.h>
+#include <Update.h>
 #include <ArduinoJson.h>
 
-#define FW_CURRENT_VERSION "1.1"
+#define FW_CURRENT_VERSION "1.0"
 #define GITHUB_VERSION_URL "https://raw.githubusercontent.com/sanok2006-ops/opel-dpf-monitor/main/version.json"
 
 #define XPT2046_IRQ 36
@@ -73,6 +74,7 @@ void drawOtaStatus(String title, String subtitle, uint16_t color);
 void connectToBT(int index);
 void startWiFiProcess();
 void checkGitHubUpdate();
+void performDirectOTA(String binUrl);
 void exitOtaToBluetooth();
 void initELM327();
 void requestData();
@@ -100,11 +102,16 @@ void setup() {
   // Сплэш-заставка
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.drawString("DPF MONITOR OPEL", 160, 85, 4);
+  tft.drawString("DPF MONITOR OPEL", 160, 65, 4);
+  
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.drawString("by Sanya (v" + String(FW_CURRENT_VERSION) + ")", 160, 125, 4);
+  tft.drawString("by Sanya", 160, 105, 4);
+  
   tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.drawString("Connecting Bluetooth...", 160, 185, 2);
+  tft.drawString("Firmware: v" + String(FW_CURRENT_VERSION), 160, 138, 2);
+  
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.drawString("Connecting Bluetooth...", 160, 195, 2);
 
   SerialBT.begin("ESP32_DPF", true); 
   SerialBT.setPin(btPin.c_str());    
@@ -112,7 +119,7 @@ void setup() {
   if (savedMAC != "") {
     parseMacString(savedMAC, elm_mac);
     elmConnected = SerialBT.connect(elm_mac);
-    if(elmConnected) {
+    if (elmConnected) {
       initELM327();
     }
   }
@@ -203,8 +210,8 @@ void parseMacString(String macStr, uint8_t* macArr) {
 void drawTile(int x, int y, int w, int h, uint16_t color, String title) {
   tft.fillRoundRect(x, y, w, h, 6, TFT_BLACK); 
   tft.drawRoundRect(x, y, w, h, 6, TFT_DARKGREY); 
-  tft.fillRoundRect(x+1, y+1, w-2, 20, 5, color); 
-  tft.fillRect(x+1, y+14, w-2, 7, color); 
+  tft.fillRoundRect(x + 1, y + 1, w - 2, 20, 5, color); 
+  tft.fillRect(x + 1, y + 14, w - 2, 7, color); 
   
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(TFT_BLACK, color);     
@@ -529,9 +536,9 @@ void drawOtaStatus(String title, String subtitle, uint16_t color) {
   tft.fillScreen(TFT_BLACK);
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(color, TFT_BLACK);
-  tft.drawString(title, 160, 90, 4);
+  tft.drawString(title, 160, 80, 4);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(subtitle, 160, 130, 2);
+  tft.drawString(subtitle, 160, 125, 2);
 }
 
 void startWiFiProcess() {
@@ -564,8 +571,13 @@ void startWiFiProcess() {
 void checkGitHubUpdate() {
   drawOtaStatus("CHECKING GITHUB...", "Reading version.json", TFT_CYAN);
   
+  WiFiClientSecure client;
+  client.setInsecure(); 
+
   HTTPClient http;
-  http.begin(GITHUB_VERSION_URL);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(client, GITHUB_VERSION_URL);
+  
   int httpCode = http.GET();
   
   if (httpCode == HTTP_CODE_OK) {
@@ -578,31 +590,95 @@ void checkGitHubUpdate() {
     String binUrl = doc["bin_url"].as<String>();
     
     if (serverVersion != FW_CURRENT_VERSION && binUrl.length() > 5) {
-      drawOtaStatus("NEW VERSION FOUND!", "v" + serverVersion + " Downloading...", TFT_GREEN);
-      delay(1500);
-      
-      Update.onProgress([](size_t progress, size_t total) {
-        int percent = (progress * 100) / total;
-        tft.fillRect(40, 150, 240, 15, TFT_BLACK);
-        drawProgressBar(40, 150, 240, 15, percent, TFT_GREEN);
-      });
-      
-      t_httpUpdate_return ret = httpUpdate.update(http, binUrl);
-      if (ret == HTTP_UPDATE_FAILED) {
-        drawOtaStatus("UPDATE ERROR!", httpUpdate.getLastErrorString(), TFT_RED);
-        delay(3000);
-        exitOtaToBluetooth();
-      }
+      performDirectOTA(binUrl);
     } else {
       drawOtaStatus("LATEST VERSION!", "You have v" + String(FW_CURRENT_VERSION), TFT_GREEN);
       delay(2500);
       exitOtaToBluetooth();
     }
   } else {
+    http.end();
     drawOtaStatus("SERVER ERROR!", "HTTP Code: " + String(httpCode), TFT_RED);
     delay(2500);
     exitOtaToBluetooth();
   }
+}
+
+// ПРЯМОЙ ПОТОКОВЫЙ ЗАГРУЗЧИК ПРОШИВКИ С GITHUB БЕЗ СБОЕВ ВЕРИФИКАЦИИ
+void performDirectOTA(String binUrl) {
+  drawOtaStatus("DOWNLOADING FIRMWARE...", "Connecting to server...", TFT_GREEN);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(client, binUrl);
+
+  int httpCode = http.GET();
+
+  if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
+    int contentLength = http.getSize();
+    
+    if (contentLength <= 0) {
+      drawOtaStatus("OTA ERROR!", "Invalid file size", TFT_RED);
+      delay(3000);
+      http.end();
+      exitOtaToBluetooth();
+      return;
+    }
+
+    bool canBegin = Update.begin(contentLength);
+
+    if (canBegin) {
+      WiFiClient* stream = http.getStreamPtr();
+      size_t written = 0;
+      int prevPercent = -1;
+      uint8_t buff[1024];
+      
+      tft.fillRect(40, 160, 240, 20, TFT_BLACK);
+      tft.drawRect(40, 160, 240, 20, TFT_WHITE);
+
+      while (http.connected() && (written < contentLength)) {
+        size_t sizeAvailable = stream->available();
+        if (sizeAvailable) {
+          int c = stream->readBytes(buff, ((sizeAvailable > sizeof(buff)) ? sizeof(buff) : sizeAvailable));
+          Update.write(buff, c);
+          written += c;
+
+          int percent = (written * 100) / contentLength;
+          if (percent != prevPercent) {
+            drawProgressBar(42, 162, 236, 16, percent, TFT_GREEN);
+            tft.setTextDatum(MC_DATUM);
+            tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+            tft.drawString(String(percent) + "%", 160, 145, 2);
+            prevPercent = percent;
+          }
+        }
+        delay(1);
+      }
+
+      if (Update.end()) {
+        if (Update.isFinished()) {
+          drawOtaStatus("SUCCESSFUL UPDATE!", "Rebooting...", TFT_GREEN);
+          delay(2000);
+          ESP.restart();
+        } else {
+          drawOtaStatus("OTA FAILED!", "Update not finished", TFT_RED);
+        }
+      } else {
+        drawOtaStatus("OTA ERROR!", "Code: " + String(Update.getError()), TFT_RED);
+      }
+    } else {
+      drawOtaStatus("NO SPACE!", "Not enough partition space", TFT_RED);
+    }
+  } else {
+    drawOtaStatus("DOWNLOAD ERROR!", "HTTP: " + String(httpCode), TFT_RED);
+  }
+
+  http.end();
+  delay(3000);
+  exitOtaToBluetooth();
 }
 
 void exitOtaToBluetooth() {
