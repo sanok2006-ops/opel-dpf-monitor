@@ -1,0 +1,799 @@
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include <BluetoothSerial.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
+#include <ArduinoJson.h>
+
+#define FW_CURRENT_VERSION "1.1"
+#define GITHUB_VERSION_URL "https://raw.githubusercontent.com/sanok2006-ops/opel-dpf-monitor/main/version.json"
+
+#define XPT2046_IRQ 36
+#define XPT2046_MOSI 32
+#define XPT2046_MISO 39
+#define XPT2046_CLK 25
+#define XPT2046_CS 33
+
+XPT2046_Touchscreen ts(XPT2046_CS, XPT2046_IRQ);
+TFT_eSPI tft = TFT_eSPI();
+BluetoothSerial SerialBT;
+Preferences prefs;
+
+int dpf_soot = -1;
+int dpf_regen = -1;
+int dpf_km = -1;
+int temp_coolant = -99;
+float temp_exhaust = -99.0;
+String voltage = "";
+
+int last_soot = -999;
+int last_regen = -999;
+int last_km = -999;
+int last_coolant = -999;
+float last_exhaust = -999.0;
+String last_voltage = "";
+int last_regen_state = -1;
+
+String savedMAC = "";
+String btPin = "1234"; 
+String savedSSID = "";
+String savedPass = "";
+uint8_t elm_mac[6] = {0,0,0,0,0,0};
+bool elmConnected = false;
+
+unsigned long lastRequest = 0;
+unsigned long touchTimer = 0;
+
+enum Screen { MAIN_SCREEN, SETTINGS_SCREEN, SCAN_SCREEN, WIFI_SCAN_SCREEN, KEYBOARD_SCREEN, OTA_STATUS_SCREEN };
+Screen currentScreen = MAIN_SCREEN;
+
+#define MAX_DEVICES 20
+String devNames[MAX_DEVICES];
+String devMacs[MAX_DEVICES];
+int devCount = 0;
+int devPage = 0;
+
+String selectedSSID = "";
+String typedPassword = "";
+bool shiftCaps = false;
+
+void handleTouch();
+void drawMainScreen();
+void updateTiles();
+void drawStatusBar();
+void drawSettingsScreen();
+void drawScanScreen();
+void drawWiFiScanScreen();
+void renderDeviceList(bool isWiFi);
+void drawKeyboard();
+void drawOtaStatus(String title, String subtitle, uint16_t color);
+void connectToBT(int index);
+void startWiFiProcess();
+void checkGitHubUpdate();
+void exitOtaToBluetooth();
+void initELM327();
+void requestData();
+String sendOBDCommand(String cmd);
+int parseHex(String response, int headerLen, int bytes);
+void parseMacString(String macStr, uint8_t* macArr);
+
+void setup() {
+  Serial.begin(115200);
+  
+  prefs.begin("dpf_app", false);
+  savedMAC = prefs.getString("mac", "");
+  btPin = prefs.getString("pin", "1234"); 
+  savedSSID = prefs.getString("ssid", "");
+  savedPass = prefs.getString("pass", "");
+
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  
+  SPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  ts.begin();
+  ts.setRotation(1);
+
+  // Сплэш-заставка
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("DPF MONITOR OPEL", 160, 85, 4);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("by Sanya (v" + String(FW_CURRENT_VERSION) + ")", 160, 125, 4);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString("Connecting Bluetooth...", 160, 185, 2);
+
+  SerialBT.begin("ESP32_DPF", true); 
+  SerialBT.setPin(btPin.c_str());    
+  
+  if (savedMAC != "") {
+    parseMacString(savedMAC, elm_mac);
+    elmConnected = SerialBT.connect(elm_mac);
+    if(elmConnected) {
+      initELM327();
+    }
+  }
+  
+  drawMainScreen();
+}
+
+void loop() {
+  handleTouch();
+  
+  if (currentScreen == MAIN_SCREEN) {
+    if (millis() - lastRequest > 800) {
+      requestData();
+      updateTiles();
+      drawStatusBar();
+      lastRequest = millis();
+    }
+  }
+}
+
+void initELM327() {
+  sendOBDCommand("ATZ");   delay(300);
+  sendOBDCommand("ATE0");
+  sendOBDCommand("ATL0");
+  sendOBDCommand("ATS0");  
+  sendOBDCommand("ATSP0"); delay(300);
+}
+
+void requestData() {
+  voltage = sendOBDCommand("ATRV");
+  
+  String ect = sendOBDCommand("0105");
+  temp_coolant = parseHex(ect, 4, 1) - 40; 
+  
+  String soot = sendOBDCommand("223275");
+  dpf_soot = parseHex(soot, 6, 1);
+  
+  String regen = sendOBDCommand("223274");
+  dpf_regen = parseHex(regen, 6, 1);
+
+  String km = sendOBDCommand("223277");
+  dpf_km = parseHex(km, 6, 2);
+  
+  String egt = sendOBDCommand("0178");
+  temp_exhaust = (parseHex(egt, 4, 2) / 10.0) - 40.0;
+}
+
+String sendOBDCommand(String cmd) {
+  while (Serial.available()) Serial.read();
+  if (elmConnected) while (SerialBT.available()) SerialBT.read();
+
+  Serial.print(cmd + "\r");
+  if (elmConnected) SerialBT.print(cmd + "\r");
+  
+  String response = "";
+  unsigned long timeout = millis() + 350; 
+  
+  while (millis() < timeout) {
+    handleTouch(); 
+    if (Serial.available()) {
+      char c = Serial.read();
+      if (c == '>') break; 
+      if (c != '\r' && c != '\n' && c != ' ') response += c;
+    }
+    if (elmConnected && SerialBT.available()) {
+      char c = SerialBT.read();
+      if (c == '>') break;
+      if (c != '\r' && c != '\n' && c != ' ') response += c;
+    }
+  }
+  return response;
+}
+
+int parseHex(String response, int headerLen, int bytes) {
+  if (response.length() < headerLen + (bytes * 2)) return 0; 
+  String dataHex = response.substring(headerLen, headerLen + (bytes * 2));
+  return (int) strtol(dataHex.c_str(), NULL, 16);
+}
+
+void parseMacString(String macStr, uint8_t* macArr) {
+  int index = 0;
+  for (int i = 0; i < 6; i++) {
+    macArr[i] = (uint8_t) strtol(macStr.substring(index, index + 2).c_str(), NULL, 16);
+    index += 3;
+  }
+}
+
+void drawTile(int x, int y, int w, int h, uint16_t color, String title) {
+  tft.fillRoundRect(x, y, w, h, 6, TFT_BLACK); 
+  tft.drawRoundRect(x, y, w, h, 6, TFT_DARKGREY); 
+  tft.fillRoundRect(x+1, y+1, w-2, 20, 5, color); 
+  tft.fillRect(x+1, y+14, w-2, 7, color); 
+  
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_BLACK, color);     
+  tft.drawString(title, x + (w / 2), y + 11, 2);
+}
+
+void updateTileValue(int x, int y, int w, int h, String value, uint16_t color) {
+  tft.fillRect(x + 4, y + 22, w - 8, 38, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(color, TFT_BLACK);
+  tft.drawString(value, x + (w / 2), y + 42, 4); 
+}
+
+void drawProgressBar(int x, int y, int w, int h, int percent, uint16_t color) {
+  if (percent > 100) percent = 100;
+  if (percent < 0) percent = 0;
+  int fillWidth = map(percent, 0, 100, 0, w);
+  tft.fillRect(x, y, fillWidth, h, color);
+  tft.fillRect(x + fillWidth, y, w - fillWidth, h, TFT_DARKGREY);
+}
+
+void drawStatusBar() {
+  int current_state = (dpf_regen > 0) ? 1 : 0;
+  if (current_state == last_regen_state) return;
+  last_regen_state = current_state;
+
+  tft.fillRect(0, 0, 320, 24, TFT_DARKGREY);
+  
+  tft.fillRoundRect(4, 2, 60, 20, 4, TFT_BLACK);
+  tft.drawRoundRect(4, 2, 60, 20, 4, TFT_WHITE);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("SET", 34, 12, 2);
+  
+  if (dpf_regen > 0) {
+    tft.fillRoundRect(68, 2, 248, 20, 4, TFT_RED);
+    tft.setTextColor(TFT_WHITE, TFT_RED);
+    tft.drawString("DPF REGEN ACTIVE!", 192, 12, 2);
+  } else {
+    tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    tft.drawString("OPEL DPF MONITOR", 192, 12, 2);
+  }
+}
+
+void drawMainScreen() {
+  currentScreen = MAIN_SCREEN;
+  tft.fillScreen(TFT_BLACK);
+  
+  last_soot = -999;
+  last_regen = -999;
+  last_km = -999;
+  last_coolant = -999;
+  last_exhaust = -999.0;
+  last_voltage = "";
+  last_regen_state = -1;
+
+  drawStatusBar();
+  
+  drawTile(5, 28, 152, 67, TFT_YELLOW, "DPF SOOT");
+  drawTile(163, 28, 152, 67, TFT_CYAN, "DPF REGEN");
+  
+  drawTile(5, 99, 152, 67, TFT_ORANGE, "EGT TEMP");
+  drawTile(163, 99, 152, 67, TFT_PURPLE, "LAST REGEN");
+  
+  drawTile(5, 170, 152, 67, TFT_MAGENTA, "BATTERY");
+  drawTile(163, 170, 152, 67, TFT_GREENYELLOW, "COOLANT");
+
+  updateTiles();
+}
+
+void updateTiles() {
+  if (currentScreen != MAIN_SCREEN) return;
+  
+  if (dpf_soot != last_soot) {
+    uint16_t sootColor = (dpf_soot > 80) ? TFT_RED : TFT_GREEN;
+    updateTileValue(5, 28, 152, 67, String(dpf_soot) + "%", sootColor);
+    drawProgressBar(12, 87, 138, 5, dpf_soot, sootColor);
+    last_soot = dpf_soot;
+  }
+
+  if (dpf_regen != last_regen) {
+    uint16_t regenColor = (dpf_regen > 0) ? TFT_GREEN : TFT_WHITE;
+    updateTileValue(163, 28, 152, 67, String(dpf_regen) + "%", regenColor);
+    drawProgressBar(170, 87, 138, 5, dpf_regen, (dpf_regen > 0) ? TFT_GREEN : TFT_DARKGREY);
+    last_regen = dpf_regen;
+  }
+
+  if ((int)temp_exhaust != (int)last_exhaust) {
+    uint16_t egtColor;
+    if (temp_exhaust < 300) egtColor = TFT_WHITE;
+    else if (temp_exhaust <= 650) egtColor = TFT_GREEN;
+    else egtColor = TFT_RED;
+    updateTileValue(5, 99, 152, 67, String(temp_exhaust, 0) + " C", egtColor);
+    last_exhaust = temp_exhaust;
+  }
+
+  if (dpf_km != last_km) {
+    uint16_t kmColor = (dpf_km > 600) ? TFT_YELLOW : TFT_WHITE;
+    updateTileValue(163, 99, 152, 67, String(dpf_km) + " km", kmColor);
+    last_km = dpf_km;
+  }
+
+  if (voltage != last_voltage) {
+    String v_str = voltage;
+    v_str.replace("V", "");
+    float v = v_str.toFloat();
+    uint16_t voltColor;
+    if (v < 12.0 || v > 14.5) voltColor = TFT_RED;
+    else voltColor = TFT_GREEN;
+    updateTileValue(5, 170, 152, 67, voltage, voltColor);
+    last_voltage = voltage;
+  }
+
+  if (temp_coolant != last_coolant) {
+    uint16_t colColor;
+    if (temp_coolant < 60) colColor = TFT_BLUE;
+    else if (temp_coolant <= 87) colColor = TFT_YELLOW;
+    else if (temp_coolant <= 107) colColor = TFT_GREEN;
+    else colColor = TFT_RED;
+    updateTileValue(163, 170, 152, 67, String(temp_coolant) + " C", colColor);
+    last_coolant = temp_coolant;
+  }
+}
+
+void drawSettingsScreen() {
+  currentScreen = SETTINGS_SCREEN;
+  tft.fillScreen(TFT_BLACK);
+  
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("SETTINGS (v" + String(FW_CURRENT_VERSION) + ")", 160, 15, 4);
+  
+  tft.fillRoundRect(10, 36, 300, 36, 6, TFT_BROWN);
+  tft.drawRoundRect(10, 36, 300, 36, 6, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_BROWN);
+  tft.drawString("BT PIN: " + btPin, 160, 54, 2);
+
+  tft.fillRoundRect(10, 78, 300, 36, 6, TFT_DARKGREEN);
+  tft.drawRoundRect(10, 78, 300, 36, 6, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+  tft.drawString("SCAN ELM327 BLUETOOTH", 160, 96, 2);
+
+  tft.fillRoundRect(10, 120, 300, 36, 6, TFT_PURPLE);
+  tft.drawRoundRect(10, 120, 300, 36, 6, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_PURPLE);
+  tft.drawString("CHECK OTA UPDATE (Wi-Fi)", 160, 138, 2);
+  
+  tft.fillRoundRect(10, 162, 145, 38, 6, TFT_BLUE);
+  tft.drawRoundRect(10, 162, 145, 38, 6, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_BLUE);
+  tft.drawString("BACK", 82, 181, 2);
+
+  tft.fillRoundRect(165, 162, 145, 38, 6, TFT_RED);
+  tft.drawRoundRect(165, 162, 145, 38, 6, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_RED);
+  tft.drawString("RESTART", 237, 181, 2);
+}
+
+void drawScanScreen() {
+  currentScreen = SCAN_SCREEN;
+  devPage = 0;
+  devCount = 0;
+  
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("SCANNING BLUETOOTH...", 160, 100, 4);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("Please wait 8 sec...", 160, 135, 2);
+  
+  BTScanResults* pResults = SerialBT.discover(8000);
+  
+  if (pResults) {
+    devCount = pResults->getCount();
+    if (devCount > MAX_DEVICES) devCount = MAX_DEVICES;
+    
+    for (int i = 0; i < devCount; i++) {
+      String name = pResults->getDevice(i)->getName().c_str();
+      if (name.length() == 0) name = "Unknown Device";
+      devNames[i] = name;
+      devMacs[i] = pResults->getDevice(i)->getAddress().toString().c_str();
+    }
+  }
+  
+  renderDeviceList(false);
+}
+
+void drawWiFiScanScreen() {
+  currentScreen = WIFI_SCAN_SCREEN;
+  devPage = 0;
+  devCount = 0;
+  
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("SCANNING WI-FI...", 160, 100, 4);
+  
+  int n = WiFi.scanNetworks();
+  if (n > 0) {
+    devCount = (n > MAX_DEVICES) ? MAX_DEVICES : n;
+    for (int i = 0; i < devCount; i++) {
+      devNames[i] = WiFi.SSID(i);
+    }
+  }
+  renderDeviceList(true);
+}
+
+void renderDeviceList(bool isWiFi) {
+  tft.fillScreen(TFT_BLACK);
+  
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(isWiFi ? "SELECT WI-FI NETWORK:" : "SELECT ADAPTER:", 10, 5, 2);
+  
+  int totalPages = (devCount + 3) / 4;
+  if (totalPages == 0) totalPages = 1;
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString(String(devPage + 1) + "/" + String(totalPages), 310, 5, 2);
+  
+  if (devCount == 0) {
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString("NO NETWORKS FOUND!", 160, 95, 4);
+  } else {
+    int startIndex = devPage * 4;
+    for (int i = 0; i < 4; i++) {
+      int devIdx = startIndex + i;
+      int y = 24 + (i * 38);
+      
+      if (devIdx < devCount) {
+        tft.fillRoundRect(5, y, 310, 34, 5, TFT_NAVY);
+        tft.drawRoundRect(5, y, 310, 34, 5, TFT_CYAN);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_WHITE, TFT_NAVY);
+        tft.drawString(devNames[devIdx], 160, y + 17, 2); 
+      }
+    }
+  }
+
+  tft.setTextDatum(MC_DATUM);
+  tft.fillRoundRect(5, 185, 70, 48, 6, TFT_DARKGREY);
+  tft.drawRoundRect(5, 185, 70, 48, 6, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  tft.drawString("BACK", 40, 209, 2);
+
+  tft.fillRoundRect(80, 185, 75, 48, 6, (devPage > 0) ? TFT_BLUE : TFT_BLACK);
+  tft.drawRoundRect(80, 185, 75, 48, 6, (devPage > 0) ? TFT_WHITE : TFT_DARKGREY);
+  tft.setTextColor((devPage > 0) ? TFT_WHITE : TFT_DARKGREY, (devPage > 0) ? TFT_BLUE : TFT_BLACK);
+  tft.drawString("UP", 117, 209, 2);
+
+  bool hasNext = ((devPage + 1) * 4 < devCount);
+  tft.fillRoundRect(160, 185, 75, 48, 6, hasNext ? TFT_BLUE : TFT_BLACK);
+  tft.drawRoundRect(160, 185, 75, 48, 6, hasNext ? TFT_WHITE : TFT_DARKGREY);
+  tft.setTextColor(hasNext ? TFT_WHITE : TFT_DARKGREY, hasNext ? TFT_BLUE : TFT_BLACK);
+  tft.drawString("DOWN", 197, 209, 2);
+
+  tft.fillRoundRect(240, 185, 75, 48, 6, TFT_DARKGREEN);
+  tft.drawRoundRect(240, 185, 75, 48, 6, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+  tft.drawString("SCAN", 277, 209, 2);
+}
+
+const char* keysLower[] = {
+  "1","2","3","4","5","6","7","8","9","0",
+  "q","w","e","r","t","y","u","i","o","p",
+  "a","s","d","f","g","h","j","k","l","-",
+  "CAPS","z","x","c","v","b","n","m",".","DEL"
+};
+const char* keysUpper[] = {
+  "!","@","#","$","%","^","&","*","(",")",
+  "Q","W","E","R","T","Y","U","I","O","P",
+  "A","S","D","F","G","H","J","K","L","_",
+  "caps","Z","X","C","V","B","N","M","?","DEL"
+};
+
+void drawKeyboard() {
+  currentScreen = KEYBOARD_SCREEN;
+  tft.fillScreen(TFT_BLACK);
+  
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("SSID: " + selectedSSID, 10, 4, 2);
+  
+  tft.fillRect(5, 22, 310, 26, TFT_NAVY);
+  tft.drawRect(5, 22, 310, 26, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
+  tft.drawString("Pass: " + typedPassword + "_", 10, 27, 2);
+
+  for (int row = 0; row < 4; row++) {
+    for (int col = 0; col < 10; col++) {
+      int idx = row * 10 + col;
+      int x = 4 + col * 31;
+      int y = 52 + row * 34;
+      int w = 29;
+      int h = 30;
+
+      uint16_t btnCol = TFT_DARKGREY;
+      if (idx == 30 || idx == 39) btnCol = TFT_BROWN;
+
+      tft.fillRoundRect(x, y, w, h, 4, btnCol);
+      tft.drawRoundRect(x, y, w, h, 4, TFT_WHITE);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextColor(TFT_WHITE, btnCol);
+      tft.drawString(shiftCaps ? keysUpper[idx] : keysLower[idx], x + (w / 2), y + (h / 2), 2);
+    }
+  }
+
+  tft.fillRoundRect(5, 192, 145, 42, 6, TFT_RED);
+  tft.drawRoundRect(5, 192, 145, 42, 6, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_RED);
+  tft.drawString("CANCEL", 77, 213, 4);
+
+  tft.fillRoundRect(165, 192, 145, 42, 6, TFT_DARKGREEN);
+  tft.drawRoundRect(165, 192, 145, 42, 6, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+  tft.drawString("CONNECT", 237, 213, 4);
+}
+
+void drawOtaStatus(String title, String subtitle, uint16_t color) {
+  currentScreen = OTA_STATUS_SCREEN;
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(color, TFT_BLACK);
+  tft.drawString(title, 160, 90, 4);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(subtitle, 160, 130, 2);
+}
+
+void startWiFiProcess() {
+  if (elmConnected) {
+    SerialBT.disconnect();
+    elmConnected = false;
+  }
+  SerialBT.end();
+  
+  WiFi.mode(WIFI_STA);
+  
+  if (savedSSID.length() > 0) {
+    drawOtaStatus("CONNECTING WI-FI...", savedSSID, TFT_YELLOW);
+    WiFi.begin(savedSSID.c_str(), savedPass.c_str());
+    
+    unsigned long startConn = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startConn < 10000) {
+      delay(300);
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      checkGitHubUpdate();
+      return;
+    }
+  }
+  
+  drawWiFiScanScreen();
+}
+
+void checkGitHubUpdate() {
+  drawOtaStatus("CHECKING GITHUB...", "Reading version.json", TFT_CYAN);
+  
+  HTTPClient http;
+  http.begin(GITHUB_VERSION_URL);
+  int httpCode = http.GET();
+  
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    http.end();
+    
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc, payload);
+    String serverVersion = doc["version"].as<String>();
+    String binUrl = doc["bin_url"].as<String>();
+    
+    if (serverVersion != FW_CURRENT_VERSION && binUrl.length() > 5) {
+      drawOtaStatus("NEW VERSION FOUND!", "v" + serverVersion + " Downloading...", TFT_GREEN);
+      delay(1500);
+      
+      Update.onProgress([](size_t progress, size_t total) {
+        int percent = (progress * 100) / total;
+        tft.fillRect(40, 150, 240, 15, TFT_BLACK);
+        drawProgressBar(40, 150, 240, 15, percent, TFT_GREEN);
+      });
+      
+      t_httpUpdate_return ret = httpUpdate.update(http, binUrl);
+      if (ret == HTTP_UPDATE_FAILED) {
+        drawOtaStatus("UPDATE ERROR!", httpUpdate.getLastErrorString(), TFT_RED);
+        delay(3000);
+        exitOtaToBluetooth();
+      }
+    } else {
+      drawOtaStatus("LATEST VERSION!", "You have v" + String(FW_CURRENT_VERSION), TFT_GREEN);
+      delay(2500);
+      exitOtaToBluetooth();
+    }
+  } else {
+    drawOtaStatus("SERVER ERROR!", "HTTP Code: " + String(httpCode), TFT_RED);
+    delay(2500);
+    exitOtaToBluetooth();
+  }
+}
+
+void exitOtaToBluetooth() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("STARTING BLUETOOTH...", 160, 120, 4);
+  
+  SerialBT.begin("ESP32_DPF", true);
+  SerialBT.setPin(btPin.c_str());
+  
+  if (savedMAC != "") {
+    parseMacString(savedMAC, elm_mac);
+    elmConnected = SerialBT.connect(elm_mac);
+    if (elmConnected) initELM327();
+  }
+  
+  drawMainScreen();
+}
+
+void connectToBT(int index) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("CONNECTING...", 160, 75, 4);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(devNames[index], 160, 115, 2);
+  
+  if (elmConnected) {
+    SerialBT.disconnect();
+    elmConnected = false;
+  }
+  
+  parseMacString(devMacs[index], elm_mac);
+  elmConnected = SerialBT.connect(elm_mac);
+  
+  if (elmConnected) {
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.drawString("CONNECTED!", 160, 165, 4);
+    
+    savedMAC = devMacs[index];
+    prefs.putString("mac", savedMAC);
+    
+    initELM327();
+    delay(1200);
+    drawMainScreen();
+  } else {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString("FAILED TO CONNECT!", 160, 165, 4);
+    delay(2000);
+    renderDeviceList(false);
+  }
+}
+
+void handleTouch() {
+  if (ts.touched() && (millis() - touchTimer > 350)) { 
+    TS_Point p = ts.getPoint();
+    int x = map(p.x, 300, 3800, 0, 320); 
+    int y = map(p.y, 300, 3800, 0, 240);
+    
+    if (currentScreen == MAIN_SCREEN) {
+      if (y < 28) {
+        drawSettingsScreen();
+        touchTimer = millis();
+      }
+    } 
+    else if (currentScreen == SETTINGS_SCREEN) {
+      if (y > 36 && y < 72) {
+        if (btPin == "1234") btPin = "0000";
+        else if (btPin == "0000") btPin = "6789";
+        else if (btPin == "6789") btPin = "8888";
+        else btPin = "1234";
+        
+        prefs.putString("pin", btPin);
+        drawSettingsScreen();
+        touchTimer = millis();
+      }
+      else if (y > 78 && y < 114) {
+        drawScanScreen();
+        touchTimer = millis();
+      }
+      else if (y > 120 && y < 156) {
+        startWiFiProcess();
+        touchTimer = millis();
+      }
+      else if (y > 162 && y < 200) {
+        if (x < 155) {
+          drawMainScreen();
+          touchTimer = millis();
+        } else {
+          ESP.restart();
+        }
+      }
+    }
+    else if (currentScreen == SCAN_SCREEN) {
+      if (y > 180) {
+        if (x < 75) { drawSettingsScreen(); touchTimer = millis(); } 
+        else if (x >= 80 && x < 155) { if (devPage > 0) { devPage--; renderDeviceList(false); touchTimer = millis(); } }
+        else if (x >= 160 && x < 235) { if ((devPage + 1) * 4 < devCount) { devPage++; renderDeviceList(false); touchTimer = millis(); } }
+        else if (x >= 240) { drawScanScreen(); touchTimer = millis(); }
+      } else {
+        for (int i = 0; i < 4; i++) {
+          int itemY = 24 + (i * 38);
+          if (y > itemY && y < itemY + 34) {
+            int selectedIdx = (devPage * 4) + i;
+            if (selectedIdx < devCount) { connectToBT(selectedIdx); touchTimer = millis(); break; }
+          }
+        }
+      }
+    }
+    else if (currentScreen == WIFI_SCAN_SCREEN) {
+      if (y > 180) {
+        if (x < 75) { exitOtaToBluetooth(); touchTimer = millis(); } 
+        else if (x >= 80 && x < 155) { if (devPage > 0) { devPage--; renderDeviceList(true); touchTimer = millis(); } }
+        else if (x >= 160 && x < 235) { if ((devPage + 1) * 4 < devCount) { devPage++; renderDeviceList(true); touchTimer = millis(); } }
+        else if (x >= 240) { drawWiFiScanScreen(); touchTimer = millis(); }
+      } else {
+        for (int i = 0; i < 4; i++) {
+          int itemY = 24 + (i * 38);
+          if (y > itemY && y < itemY + 34) {
+            int selectedIdx = (devPage * 4) + i;
+            if (selectedIdx < devCount) {
+              selectedSSID = devNames[selectedIdx];
+              typedPassword = "";
+              drawKeyboard();
+              touchTimer = millis();
+              break;
+            }
+          }
+        }
+      }
+    }
+    else if (currentScreen == KEYBOARD_SCREEN) {
+      if (y > 192) {
+        if (x < 155) {
+          drawWiFiScanScreen();
+          touchTimer = millis();
+        } else {
+          drawOtaStatus("CONNECTING...", selectedSSID, TFT_YELLOW);
+          WiFi.begin(selectedSSID.c_str(), typedPassword.c_str());
+          
+          unsigned long startConn = millis();
+          while (WiFi.status() != WL_CONNECTED && millis() - startConn < 10000) {
+            delay(300);
+          }
+          
+          if (WiFi.status() == WL_CONNECTED) {
+            savedSSID = selectedSSID;
+            savedPass = typedPassword;
+            prefs.putString("ssid", savedSSID);
+            prefs.putString("pass", savedPass);
+            checkGitHubUpdate();
+          } else {
+            drawOtaStatus("FAILED TO CONNECT!", "Wrong password?", TFT_RED);
+            delay(2000);
+            drawKeyboard();
+          }
+          touchTimer = millis();
+        }
+      } 
+      else if (y >= 52 && y < 188) {
+        int row = (y - 52) / 34;
+        int col = (x - 4) / 31;
+        if (row >= 0 && row < 4 && col >= 0 && col < 10) {
+          int idx = row * 10 + col;
+          if (idx == 30) {
+            shiftCaps = !shiftCaps;
+            drawKeyboard();
+          } else if (idx == 39) {
+            if (typedPassword.length() > 0) {
+              typedPassword.remove(typedPassword.length() - 1);
+              tft.fillRect(5, 22, 310, 26, TFT_NAVY);
+              tft.drawRect(5, 22, 310, 26, TFT_WHITE);
+              tft.setTextColor(TFT_WHITE, TFT_NAVY);
+              tft.setTextDatum(TL_DATUM);
+              tft.drawString("Pass: " + typedPassword + "_", 10, 27, 2);
+            }
+          } else {
+            typedPassword += shiftCaps ? keysUpper[idx] : keysLower[idx];
+            tft.fillRect(5, 22, 310, 26, TFT_NAVY);
+            tft.drawRect(5, 22, 310, 26, TFT_WHITE);
+            tft.setTextColor(TFT_WHITE, TFT_NAVY);
+            tft.setTextDatum(TL_DATUM);
+            tft.drawString("Pass: " + typedPassword + "_", 10, 27, 2);
+          }
+          touchTimer = millis();
+        }
+      }
+    }
+  }
+}
